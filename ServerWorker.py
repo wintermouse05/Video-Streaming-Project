@@ -1,5 +1,5 @@
 from random import randint
-import sys, traceback, threading, socket
+import sys, traceback, threading, socket, struct
 
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
@@ -67,8 +67,21 @@ class ServerWorker:
 				# Send RTSP reply
 				self.replyRtsp(self.OK_200, seq[1])
 				
-				# Get the RTP/UDP port from the last line
-				self.clientInfo['rtpPort'] = request[2].split(' ')[3]
+				# Parse transport line for mode and port
+				transportLine = request[2]
+				
+				# 3.3: Detect transport mode (TCP or UDP)
+				if 'RTP/TCP' in transportLine:
+					self.clientInfo['transportMode'] = 'TCP'
+					print("[SERVER] Transport mode: TCP (HD)")
+				else:
+					self.clientInfo['transportMode'] = 'UDP'
+					print("[SERVER] Transport mode: UDP (SD)")
+				
+				# Extract client port (robust parsing)
+				portStr = transportLine.split('client_port=')[1].strip().rstrip('\r\n')
+				# Remove any non-digit characters
+				self.clientInfo['rtpPort'] = ''.join(c for c in portStr if c.isdigit())
 		
 		# Process PLAY request 		
 		elif requestType == self.PLAY:
@@ -76,8 +89,18 @@ class ServerWorker:
 				print("processing PLAY\n")
 				self.state = self.PLAYING
 				
-				# Create a new socket for RTP/UDP
-				self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+				# 3.3: Create socket based on transport mode
+				if self.clientInfo.get('transportMode') == 'TCP':
+					# TCP mode: connect to client's TCP RTP port (reuse if exists)
+					if 'rtpSocket' not in self.clientInfo or self.clientInfo['rtpSocket'] is None:
+						self.clientInfo['rtpSocket'] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+						address = self.clientInfo['rtspSocket'][1][0]
+						port = int(self.clientInfo['rtpPort'])
+						self.clientInfo['rtpSocket'].connect((address, port))
+						print(f"[SERVER] TCP RTP connected to {address}:{port}")
+				else:
+					# UDP mode: create a new datagram socket
+					self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 				
 				self.replyRtsp(self.OK_200, seq[1])
 				
@@ -105,10 +128,14 @@ class ServerWorker:
 			self.replyRtsp(self.OK_200, seq[1])
 			
 			# Close the RTP socket
-			self.clientInfo['rtpSocket'].close()
+			try:
+				self.clientInfo['rtpSocket'].close()
+			except:
+				pass
+			self.clientInfo['rtpSocket'] = None
 			
 	def sendRtp(self):
-		"""Send RTP packets over UDP."""
+		"""Send RTP packets over UDP or TCP."""
 		while True:
 			self.clientInfo['event'].wait(0.05) 
 			
@@ -120,9 +147,18 @@ class ServerWorker:
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
 				try:
-					address = self.clientInfo['rtspSocket'][1][0]
-					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
+					packet = self.makeRtp(data, frameNumber)
+					
+					# 3.3: Send via TCP or UDP based on transport mode
+					if self.clientInfo.get('transportMode') == 'TCP':
+						# TCP: send with 4-byte length prefix
+						lengthPrefix = struct.pack('>I', len(packet))
+						self.clientInfo['rtpSocket'].sendall(lengthPrefix + packet)
+					else:
+						# UDP: send as datagram
+						address = self.clientInfo['rtspSocket'][1][0]
+						port = int(self.clientInfo['rtpPort'])
+						self.clientInfo['rtpSocket'].sendto(packet, (address, port))
 				except:
 					print("Connection Error")
 					#print('-'*60)
@@ -135,7 +171,7 @@ class ServerWorker:
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		marker = 1  # 2.6: Mark as last (only) fragment of the frame
 		pt = 26 # MJPEG type
 		seqnum = frameNbr
 		ssrc = 0 

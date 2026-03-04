@@ -2,11 +2,15 @@ from tkinter import *
 import tkinter.messagebox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
+import time as time_module
+from collections import deque
+import struct
 
 from RtpPacket import RtpPacket
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
+BUFFER_SIZE = 10  # Number of frames to buffer before displaying (3.1)
 
 class Client:
 	INIT = 0
@@ -20,7 +24,7 @@ class Client:
 	TEARDOWN = 3
 	
 	# Initiation..
-	def __init__(self, master, serveraddr, serverport, rtpport, filename):
+	def __init__(self, master, serveraddr, serverport, rtpport, filename, mode='SD'):
 		self.master = master
 		self.master.protocol("WM_DELETE_WINDOW", self.handler)
 		self.createWidgets()
@@ -34,6 +38,26 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+		
+		# 3.3: SD/HD Mode
+		self.mode = mode  # 'SD' for UDP, 'HD' for TCP
+		self.tcpConnected = False
+		
+		# 3.1: Frame Buffer Queue
+		self.frameBuffer = deque()
+		self.bufferReady = False
+		
+		# 3.4: FPS Monitor
+		self.fpsCounter = 0
+		self.fpsStartTime = time_module.time()
+		
+		# 3.5: Packet Loss Detection
+		self.expectedSeqNum = 1
+		self.lostPackets = 0
+		self.totalPackets = 0
+		
+		# 2.6: Fragment reassembly buffer
+		self.fragmentBuffer = bytearray()
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -72,9 +96,31 @@ class Client:
 	
 	def exitClient(self):
 		"""Teardown button handler."""
-		self.sendRtspRequest(self.TEARDOWN)		
-		self.master.destroy() # Close the gui window
-		os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		# 3.5: Print final packet loss stats
+		if self.totalPackets > 0:
+			totalExpected = self.totalPackets + self.lostPackets
+			lossRate = (self.lostPackets / totalExpected) * 100
+			print(f"\n{'='*50}")
+			print(f"[STATS] Session Summary ({self.mode} mode - {'TCP' if self.mode == 'HD' else 'UDP'}):")
+			print(f"  Total packets received: {self.totalPackets}")
+			print(f"  Packets lost: {self.lostPackets}")
+			print(f"  Packet loss rate: {lossRate:.2f}%")
+			print(f"{'='*50}\n")
+		
+		self.sendRtspRequest(self.TEARDOWN)
+		self.master.destroy()
+		
+		try:
+			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT)
+		except:
+			pass
+		
+		# Close TCP server socket if HD mode
+		if self.mode == 'HD' and hasattr(self, 'rtpServerSocket'):
+			try:
+				self.rtpServerSocket.close()
+			except:
+				pass
 
 	def pauseMovie(self):
 		"""Pause button handler."""
@@ -89,22 +135,93 @@ class Client:
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
 			self.sendRtspRequest(self.PLAY)
+			
+			# 3.1: Reset buffer state
+			if len(self.frameBuffer) > 0:
+				self.bufferReady = True  # Resume with existing buffer
+			else:
+				self.bufferReady = False
+			
+			# 3.4: Reset FPS counter
+			self.fpsCounter = 0
+			self.fpsStartTime = time_module.time()
+			
+			# Start display loop from buffer
+			self.master.after(100, self.displayFromBuffer)
 	
 	def listenRtp(self):		
-		"""Listen for RTP packets."""
+		"""Listen for RTP packets and add to frame buffer."""
+		# 3.3: For TCP/HD mode, accept connection on first PLAY
+		if self.mode == 'HD' and not self.tcpConnected:
+			try:
+				self.rtpServerSocket.settimeout(10)
+				self.rtpSocket, _ = self.rtpServerSocket.accept()
+				self.rtpSocket.settimeout(0.5)
+				self.tcpConnected = True
+				print("[TCP] RTP data connection established")
+			except Exception as e:
+				print(f"[ERROR] TCP accept failed: {e}")
+				return
+		
 		while True:
 			try:
-				data = self.rtpSocket.recv(20480)
+				if self.mode == 'HD':
+					# TCP mode: read length-prefixed RTP packets
+					lengthBytes = self.recvExact(self.rtpSocket, 4)
+					if lengthBytes is None:
+						if self.playEvent.isSet() or self.teardownAcked == 1:
+							break
+						continue
+					length = struct.unpack('>I', lengthBytes)[0]
+					data = self.recvExact(self.rtpSocket, length)
+					if data is None:
+						if self.playEvent.isSet() or self.teardownAcked == 1:
+							break
+						continue
+				else:
+					# UDP mode (original behavior)
+					data = self.rtpSocket.recv(20480)
+				
 				if data:
 					rtpPacket = RtpPacket()
 					rtpPacket.decode(data)
 					
 					currFrameNbr = rtpPacket.seqNum()
 					print("Current Seq Num: " + str(currFrameNbr))
-										
+					
+					# 3.5: Packet Loss Detection
+					if currFrameNbr > self.expectedSeqNum:
+						lost = currFrameNbr - self.expectedSeqNum
+						self.lostPackets += lost
+						print(f"[PACKET LOSS] Lost {lost} packet(s): expected seq {self.expectedSeqNum}, got {currFrameNbr}")
+					if currFrameNbr >= self.expectedSeqNum:
+						self.expectedSeqNum = currFrameNbr + 1
+					self.totalPackets += 1
+					
 					if currFrameNbr > self.frameNbr: # Discard the late packet
 						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+						# 2.6: Fragment reassembly based on Marker bit
+						self.fragmentBuffer.extend(rtpPacket.getPayload())
+						
+						if rtpPacket.marker() == 1:
+							# Marker=1 means last fragment of the frame → complete frame
+							self.frameBuffer.append(bytes(self.fragmentBuffer))
+							self.fragmentBuffer = bytearray()
+						else:
+							# Marker=0 means more fragments coming, keep accumulating
+							pass
+			except socket.timeout:
+				# Timeout is normal - check stop conditions
+				if self.playEvent.isSet():
+					break
+				if self.teardownAcked == 1:
+					try:
+						self.rtpSocket.shutdown(socket.SHUT_RDWR)
+						self.rtpSocket.close()
+					except:
+						pass
+					break
+				continue
 			except:
 				# Stop listening upon requesting PAUSE or TEARDOWN
 				if self.playEvent.isSet(): 
@@ -113,9 +230,64 @@ class Client:
 				# Upon receiving ACK for TEARDOWN request,
 				# close the RTP socket
 				if self.teardownAcked == 1:
-					self.rtpSocket.shutdown(socket.SHUT_RDWR)
-					self.rtpSocket.close()
+					try:
+						self.rtpSocket.shutdown(socket.SHUT_RDWR)
+						self.rtpSocket.close()
+					except:
+						pass
 					break
+	
+	def recvExact(self, sock, n):
+		"""Receive exactly n bytes from a TCP socket (3.3 HD mode helper)."""
+		data = b''
+		while len(data) < n:
+			if self.playEvent.isSet() or self.teardownAcked == 1:
+				return None
+			try:
+				chunk = sock.recv(n - len(data))
+				if not chunk:
+					return None
+				data += chunk
+			except socket.timeout:
+				continue
+		return data
+	
+	def displayFromBuffer(self):
+		"""Display frames from the buffer queue (3.1 + 3.2 + 3.4)."""
+		if self.playEvent.isSet() or self.teardownAcked == 1:
+			return
+		
+		# 3.1: Wait for buffer to fill before first display
+		if not self.bufferReady:
+			if len(self.frameBuffer) >= BUFFER_SIZE:
+				self.bufferReady = True
+				print(f"[BUFFER] Initial buffering complete ({BUFFER_SIZE} frames)")
+			else:
+				# Still buffering, check again later
+				self.master.after(50, self.displayFromBuffer)
+				return
+		
+		if len(self.frameBuffer) > 0:
+			frame = self.frameBuffer.popleft()
+			self.updateMovie(self.writeFrame(frame))
+			
+			# 3.4: FPS Monitor
+			self.fpsCounter += 1
+			now = time_module.time()
+			elapsed = now - self.fpsStartTime
+			if elapsed >= 1.0:
+				fps = self.fpsCounter / elapsed
+				print(f"[FPS] {fps:.1f} frames/sec | Buffer: {len(self.frameBuffer)} | Lost: {self.lostPackets}")
+				self.fpsCounter = 0
+				self.fpsStartTime = now
+		else:
+			# 3.2: Jitter Handling - buffer underrun
+			if self.bufferReady:
+				print("[JITTER] Buffer underrun - pausing display temporarily")
+				self.bufferReady = False
+		
+		# Schedule next display (~20 FPS = 50ms interval)
+		self.master.after(50, self.displayFromBuffer)
 					
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
@@ -148,10 +320,16 @@ class Client:
 			# Update RTSP sequence number.
 			self.rtspSeq += 1
 			
+			# 3.3: Determine transport based on mode
+			if self.mode == 'HD':
+				transport = 'RTP/TCP'
+			else:
+				transport = 'RTP/UDP'
+			
 			# Write the RTSP request to be sent.
 			request = 'SETUP ' + self.fileName + ' RTSP/1.0\r\n' \
 			          + 'CSeq: ' + str(self.rtspSeq) + '\r\n' \
-			          + 'Transport: RTP/UDP; client_port=' + str(self.rtpPort) + '\r\n\r\n'
+			          + 'Transport: ' + transport + '; client_port= ' + str(self.rtpPort) + '\r\n\r\n'
 			
 			# Keep track of the sent request.
 			self.requestSent = self.SETUP
@@ -252,17 +430,24 @@ class Client:
 	
 	def openRtpPort(self):
 		"""Open RTP socket binded to a specified port."""
-		# Create a new datagram socket to receive RTP packets from the server
-		self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		
-		# Set the timeout value of the socket to 0.5sec
-		self.rtpSocket.settimeout(0.5)
-		
-		try:
-			# Bind the socket to the address using the RTP port given by the client user
-			self.rtpSocket.bind(('', self.rtpPort))
-		except:
-			tkinter.messagebox.showwarning('Unable to Bind', 'Unable to bind PORT=%d' %self.rtpPort)
+		if self.mode == 'HD':
+			# 3.3: TCP mode - create TCP server socket for RTP data
+			self.rtpServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			self.rtpServerSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+			try:
+				self.rtpServerSocket.bind(('', self.rtpPort))
+				self.rtpServerSocket.listen(1)
+				print(f"[TCP] Listening for RTP data on port {self.rtpPort}")
+			except:
+				tkinter.messagebox.showwarning('Unable to Bind', 'Unable to bind TCP PORT=%d' % self.rtpPort)
+		else:
+			# UDP mode (original behavior)
+			self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+			self.rtpSocket.settimeout(0.5)
+			try:
+				self.rtpSocket.bind(('', self.rtpPort))
+			except:
+				tkinter.messagebox.showwarning('Unable to Bind', 'Unable to bind PORT=%d' %self.rtpPort)
 
 	def handler(self):
 		"""Handler on explicitly closing the GUI window."""
