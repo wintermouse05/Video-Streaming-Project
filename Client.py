@@ -22,6 +22,7 @@ class Client:
 	PLAY = 1
 	PAUSE = 2
 	TEARDOWN = 3
+	DESCRIBE = 4
 	
 	# Initiation..
 	def __init__(self, master, serveraddr, serverport, rtpport, filename, mode='SD'):
@@ -85,14 +86,24 @@ class Client:
 		self.teardown["command"] =  self.exitClient
 		self.teardown.grid(row=1, column=3, padx=2, pady=2)
 		
+		# Create Describe button
+		self.describe = Button(self.master, width=20, padx=3, pady=3)
+		self.describe["text"] = "Describe"
+		self.describe["command"] = self.describeMovie
+		self.describe.grid(row=1, column=4, padx=2, pady=2)
+		
 		# Create a label to display the movie
 		self.label = Label(self.master, height=19)
-		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
+		self.label.grid(row=0, column=0, columnspan=5, sticky=W+E+N+S, padx=5, pady=5) 
 	
 	def setupMovie(self):
 		"""Setup button handler."""
 		if self.state == self.INIT:
 			self.sendRtspRequest(self.SETUP)
+	
+	def describeMovie(self):
+		"""Describe button handler - request stream info from server."""
+		self.sendRtspRequest(self.DESCRIBE)
 	
 	def exitClient(self):
 		"""Teardown button handler."""
@@ -372,6 +383,19 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.TEARDOWN
+		
+		# Describe request
+		elif requestCode == self.DESCRIBE:
+			# Update RTSP sequence number.
+			self.rtspSeq += 1
+			
+			# Write the RTSP request to be sent.
+			request = 'DESCRIBE ' + self.fileName + ' RTSP/1.0\r\n' \
+			          + 'CSeq: ' + str(self.rtspSeq) + '\r\n' \
+			          + 'Session: ' + str(self.sessionId) + '\r\n\r\n'
+			
+			# Keep track of the sent request.
+			self.requestSent = self.DESCRIBE
 		else:
 			return
 		
@@ -427,6 +451,9 @@ class Client:
 						
 						# Flag the teardownAcked to close the socket.
 						self.teardownAcked = 1 
+					elif self.requestSent == self.DESCRIBE:
+						# Parse SDP body from the response
+						self.parseDescribeResponse(data)
 	
 	def openRtpPort(self):
 		"""Open RTP socket binded to a specified port."""
@@ -456,3 +483,42 @@ class Client:
 			self.exitClient()
 		else: # When the user presses cancel, resume playing.
 			self.playMovie()
+	
+	def parseDescribeResponse(self, data):
+		"""Parse DESCRIBE response and display stream info."""
+		try:
+			# Extract SDP body (after the blank line)
+			parts = data.split('\n\n', 1)
+			if len(parts) > 1:
+				sdpBody = parts[1]
+			else:
+				sdpBody = data
+			
+			# Parse SDP attributes
+			info = []
+			for line in sdpBody.strip().split('\n'):
+				line = line.strip()
+				if line.startswith('s='):
+					info.append(f"Stream: {line[2:]}")
+				elif line.startswith('i='):
+					info.append(f"Info: {line[2:]}")
+				elif line.startswith('m='):
+					info.append(f"Media: {line[2:]}")
+				elif line.startswith('a=mimetype:'):
+					info.append(f"Type: {line[11:]}")
+				elif line.startswith('a=filesize:'):
+					size = int(line[11:])
+					if size > 1024 * 1024:
+						info.append(f"Size: {size / (1024*1024):.1f} MB")
+					elif size > 1024:
+						info.append(f"Size: {size / 1024:.1f} KB")
+					else:
+						info.append(f"Size: {size} bytes")
+				elif line.startswith('a=transport:'):
+					info.append(f"Transport: {line[12:]}")
+			
+			infoText = '\n'.join(info) if info else sdpBody
+			tkinter.messagebox.showinfo("Stream Description", infoText)
+			print(f"[DESCRIBE] {infoText}")
+		except Exception as e:
+			print(f"[DESCRIBE] Error parsing response: {e}")

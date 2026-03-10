@@ -9,6 +9,7 @@ class ServerWorker:
 	PLAY = 'PLAY'
 	PAUSE = 'PAUSE'
 	TEARDOWN = 'TEARDOWN'
+	DESCRIBE = 'DESCRIBE'
 	
 	INIT = 0
 	READY = 1
@@ -20,9 +21,11 @@ class ServerWorker:
 	CON_ERR_500 = 2
 	
 	clientInfo = {}
+	seqNum = 0  # Global sequence number that increments for each RTP packet
 	
 	def __init__(self, clientInfo):
 		self.clientInfo = clientInfo
+		self.seqNum = 0  # Reset sequence number for each client
 		
 	def run(self):
 		threading.Thread(target=self.recvRtspRequest).start()
@@ -67,21 +70,19 @@ class ServerWorker:
 				# Send RTSP reply
 				self.replyRtsp(self.OK_200, seq[1])
 				
-				# Parse transport line for mode and port
+				# Parse transport line: "Transport: RTP/UDP; client_port= 25000" or "Transport: RTP/TCP; client_port= 25000"
 				transportLine = request[2]
 				
-				# 3.3: Detect transport mode (TCP or UDP)
-				if 'RTP/TCP' in transportLine:
-					self.clientInfo['transportMode'] = 'TCP'
-					print("[SERVER] Transport mode: TCP (HD)")
+				# Check if TCP or UDP transport
+				if 'TCP' in transportLine.upper():
+					self.clientInfo['transport'] = 'TCP'
 				else:
-					self.clientInfo['transportMode'] = 'UDP'
-					print("[SERVER] Transport mode: UDP (SD)")
+					self.clientInfo['transport'] = 'UDP'
 				
-				# Extract client port (robust parsing)
-				portStr = transportLine.split('client_port=')[1].strip().rstrip('\r\n')
-				# Remove any non-digit characters
-				self.clientInfo['rtpPort'] = ''.join(c for c in portStr if c.isdigit())
+				# Get the RTP port from the transport line (strip \r\n whitespace)
+				self.clientInfo['rtpPort'] = transportLine.split(' ')[3].strip()
+				
+				print(f"Transport: {self.clientInfo['transport']}, Port: {self.clientInfo['rtpPort']}")
 		
 		# Process PLAY request 		
 		elif requestType == self.PLAY:
@@ -89,17 +90,28 @@ class ServerWorker:
 				print("processing PLAY\n")
 				self.state = self.PLAYING
 				
-				# 3.3: Create socket based on transport mode
-				if self.clientInfo.get('transportMode') == 'TCP':
-					# TCP mode: connect to client's TCP RTP port (reuse if exists)
-					if 'rtpSocket' not in self.clientInfo or self.clientInfo['rtpSocket'] is None:
-						self.clientInfo['rtpSocket'] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-						address = self.clientInfo['rtspSocket'][1][0]
-						port = int(self.clientInfo['rtpPort'])
-						self.clientInfo['rtpSocket'].connect((address, port))
-						print(f"[SERVER] TCP RTP connected to {address}:{port}")
+				address = self.clientInfo['rtspSocket'][1][0]
+				port = int(self.clientInfo['rtpPort'])
+				
+				# Create socket based on transport type
+				if self.clientInfo.get('transport') == 'TCP':
+					# TCP mode for HD streaming
+					self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+					self.clientInfo["rtpSocket"].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+					
+					# Set TCP buffer size for HD streaming
+					self.clientInfo["rtpSocket"].setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+					
+					try:
+						# Connect to client's TCP port
+						self.clientInfo["rtpSocket"].connect((address, port))
+						print(f"TCP connection established to {address}:{port}")
+					except Exception as e:
+						print(f"TCP connection failed: {e}")
+						self.state = self.READY
+						return
 				else:
-					# UDP mode: create a new datagram socket
+					# UDP mode (default)
 					self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 				
 				self.replyRtsp(self.OK_200, seq[1])
@@ -123,17 +135,34 @@ class ServerWorker:
 		elif requestType == self.TEARDOWN:
 			print("processing TEARDOWN\n")
 
-			self.clientInfo['event'].set()
+			# Stop the streaming thread
+			if 'event' in self.clientInfo:
+				self.clientInfo['event'].set()
 			
 			self.replyRtsp(self.OK_200, seq[1])
 			
 			# Close the RTP socket
-			try:
-				self.clientInfo['rtpSocket'].close()
-			except:
-				pass
-			self.clientInfo['rtpSocket'] = None
+			if 'rtpSocket' in self.clientInfo:
+				try:
+					self.clientInfo['rtpSocket'].close()
+				except:
+					pass
 			
+			# Reset state and session
+			self.state = self.INIT
+			self.clientInfo['session'] = 0
+			self.seqNum = 0
+		
+		# Process DESCRIBE request
+		elif requestType == self.DESCRIBE:
+			print("processing DESCRIBE\n")
+			self.replyDescribe(seq[1], filename)
+			
+	# Maximum payload size for RTP packet (avoid IP fragmentation)
+	MAX_RTP_PAYLOAD_SIZE = 1400
+	# For TCP HD streaming, we can use larger payload
+	MAX_TCP_PAYLOAD_SIZE = 65000
+	
 	def sendRtp(self):
 		"""Send RTP packets over UDP or TCP."""
 		while True:
@@ -146,39 +175,73 @@ class ServerWorker:
 			data = self.clientInfo['videoStream'].nextFrame()
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
+				# Use frameNumber as timestamp (same for all fragments of a frame)
+				timestamp = frameNumber * 90  # 90kHz clock typical for video
+				
 				try:
-					packet = self.makeRtp(data, frameNumber)
+					address = self.clientInfo['rtspSocket'][1][0]
+					port = int(self.clientInfo['rtpPort'])
 					
-					# 3.3: Send via TCP or UDP based on transport mode
-					if self.clientInfo.get('transportMode') == 'TCP':
-						# TCP: send with 4-byte length prefix
-						lengthPrefix = struct.pack('>I', len(packet))
-						self.clientInfo['rtpSocket'].sendall(lengthPrefix + packet)
+					# Check transport type
+					isTcp = self.clientInfo.get('transport') == 'TCP'
+					
+					if isTcp:
+						# TCP mode for HD streaming - send entire frame
+						# TCP handles fragmentation at transport layer, so we can send larger packets
+						self.seqNum += 1
+						packet = self.makeRtp(data, self.seqNum, marker=1, timestamp=timestamp)
+						
+						# Prefix packet with 4-byte length header for TCP framing
+						packetLen = len(packet)
+						lengthHeader = packetLen.to_bytes(4, byteorder='big')
+						
+						try:
+							self.clientInfo['rtpSocket'].sendall(lengthHeader + packet)
+						except (BrokenPipeError, ConnectionResetError):
+							print("TCP connection lost")
+							break
 					else:
-						# UDP: send as datagram
-						address = self.clientInfo['rtspSocket'][1][0]
-						port = int(self.clientInfo['rtpPort'])
-						self.clientInfo['rtpSocket'].sendto(packet, (address, port))
-				except:
-					print("Connection Error")
+						# UDP mode - fragment if necessary
+						if len(data) > self.MAX_RTP_PAYLOAD_SIZE:
+							# Calculate number of fragments needed
+							numFragments = (len(data) + self.MAX_RTP_PAYLOAD_SIZE - 1) // self.MAX_RTP_PAYLOAD_SIZE
+							
+							for i in range(numFragments):
+								start = i * self.MAX_RTP_PAYLOAD_SIZE
+								end = min(start + self.MAX_RTP_PAYLOAD_SIZE, len(data))
+								fragment = data[start:end]
+								
+								# Use marker bit to indicate last fragment
+								isLastFragment = (i == numFragments - 1)
+								
+								# Increment sequence number for each packet (continuous)
+								self.seqNum += 1
+								
+								packet = self.makeRtp(fragment, self.seqNum, marker=1 if isLastFragment else 0, timestamp=timestamp)
+								self.clientInfo['rtpSocket'].sendto(packet, (address, port))
+						else:
+							# No fragmentation needed, send as single packet with marker=1
+							self.seqNum += 1
+							self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, self.seqNum, marker=1, timestamp=timestamp), (address, port))
+				except Exception as e:
+					print(f"Connection Error: {e}")
 					#print('-'*60)
 					#traceback.print_exc(file=sys.stdout)
 					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
+	def makeRtp(self, payload, seqNum, marker=0, timestamp=None):
 		"""RTP-packetize the video data."""
 		version = 2
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 1  # 2.6: Mark as last (only) fragment of the frame
+
 		pt = 26 # MJPEG type
-		seqnum = frameNbr
 		ssrc = 0 
 		
 		rtpPacket = RtpPacket()
 		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
+		rtpPacket.encode(version, padding, extension, cc, seqNum, marker, pt, ssrc, payload, timestamp)
 		
 		return rtpPacket.getPacket()
 		
@@ -195,3 +258,39 @@ class ServerWorker:
 			print("404 NOT FOUND")
 		elif code == self.CON_ERR_500:
 			print("500 CONNECTION ERROR")
+	
+	def replyDescribe(self, seq, filename):
+		"""Send DESCRIBE reply with stream metadata (SDP format)."""
+		try:
+			# Get video stream info
+			import os
+			fileSize = os.path.getsize(filename) if os.path.exists(filename) else 0
+			
+			# Build SDP (Session Description Protocol) body
+			sdpBody = (
+				'v=0\n'
+				f's={filename}\n'
+				f'i=MJPEG Video Stream\n'
+				f't=0 0\n'
+				f'm=video 0 RTP/AVP 26\n'
+				f'a=control:streamid=0\n'
+				f'a=mimetype:video/MJPEG\n'
+				f'a=filesize:{fileSize}\n'
+				f'a=transport:UDP,TCP\n'
+			)
+			
+			reply = (
+				f'RTSP/1.0 200 OK\n'
+				f'CSeq: {seq}\n'
+				f'Session: {self.clientInfo.get("session", 0)}\n'
+				f'Content-Type: application/sdp\n'
+				f'Content-Length: {len(sdpBody)}\n'
+				f'\n'
+				f'{sdpBody}'
+			)
+			
+			connSocket = self.clientInfo['rtspSocket'][0]
+			connSocket.send(reply.encode())
+			print(f"DESCRIBE reply sent for {filename}")
+		except Exception as e:
+			print(f"Error in DESCRIBE: {e}")
