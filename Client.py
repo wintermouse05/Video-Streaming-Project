@@ -1,10 +1,12 @@
 from tkinter import *
 import tkinter.messagebox
+from tkinter import ttk
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
 import time as time_module
 from collections import deque
 import struct
+import io
 
 from RtpPacket import RtpPacket
 
@@ -61,40 +63,93 @@ class Client:
 		self.fragmentBuffer = bytearray()
 		
 	def createWidgets(self):
-		"""Build GUI."""
-		# Create Setup button
-		self.setup = Button(self.master, width=20, padx=3, pady=3)
-		self.setup["text"] = "Setup"
-		self.setup["command"] = self.setupMovie
-		self.setup.grid(row=1, column=0, padx=2, pady=2)
+		"""Build modern GUI with auto-scaling video."""
+		# Configure dark theme colors
+		self.BG_COLOR = '#1e1e2e'
+		self.BG_SECONDARY = '#2a2a3d'
+		self.ACCENT = '#475569'
+		self.ACCENT_HOVER = '#334155'   
+		self.TEXT_COLOR = '#e2e8f0'
+		self.TEXT_DIM = '#94a3b8'
+		self.BORDER_COLOR = '#374151'
+		self.SUCCESS = '#22c55e'
+		self.DANGER = '#ef4444'
+		self.WARNING = '#f59e0b'
 		
-		# Create Play button		
-		self.start = Button(self.master, width=20, padx=3, pady=3)
-		self.start["text"] = "Play"
-		self.start["command"] = self.playMovie
-		self.start.grid(row=1, column=1, padx=2, pady=2)
+		self.master.configure(bg=self.BG_COLOR)
+		self.master.minsize(640, 480)
 		
-		# Create Pause button			
-		self.pause = Button(self.master, width=20, padx=3, pady=3)
-		self.pause["text"] = "Pause"
-		self.pause["command"] = self.pauseMovie
-		self.pause.grid(row=1, column=2, padx=2, pady=2)
+		# Make the video area expand to fill window
+		self.master.grid_rowconfigure(0, weight=1)
+		self.master.grid_columnconfigure(0, weight=1)
 		
-		# Create Teardown button
-		self.teardown = Button(self.master, width=20, padx=3, pady=3)
-		self.teardown["text"] = "Teardown"
-		self.teardown["command"] =  self.exitClient
-		self.teardown.grid(row=1, column=3, padx=2, pady=2)
+		# === Video Display Area (row 0) - takes most space ===
+		self.videoFrame = Frame(self.master, bg='#000000', bd=0, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+		self.videoFrame.grid(row=0, column=0, sticky='nsew', padx=8, pady=(8, 4))
+		self.videoFrame.grid_rowconfigure(0, weight=1)
+		self.videoFrame.grid_columnconfigure(0, weight=1)
 		
-		# Create Describe button
-		self.describe = Button(self.master, width=20, padx=3, pady=3)
-		self.describe["text"] = "Describe"
-		self.describe["command"] = self.describeMovie
-		self.describe.grid(row=1, column=4, padx=2, pady=2)
+		self.label = Label(self.videoFrame, bg='#000000', text='⏵  Press Setup to begin', 
+			fg=self.TEXT_DIM, font=('Segoe UI', 14), anchor='center')
+		self.label.grid(row=0, column=0, sticky='nsew')
 		
-		# Create a label to display the movie
-		self.label = Label(self.master, height=19)
-		self.label.grid(row=0, column=0, columnspan=5, sticky=W+E+N+S, padx=5, pady=5) 
+		# === Control Bar (row 1) - compact buttons ===
+		self.controlFrame = Frame(self.master, bg=self.BG_SECONDARY, bd=0, 
+			highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+		self.controlFrame.grid(row=1, column=0, sticky='ew', padx=8, pady=4)
+		
+		# Button styling
+		btn_font = ('Segoe UI', 10, 'bold')
+		btn_padx = 16
+		btn_pady = 6
+		
+		# Define a flexible inner frame for buttons to keep them left-aligned
+		self.btnContainer = Frame(self.controlFrame, bg=self.BG_SECONDARY)
+		self.btnContainer.pack(side=LEFT, fill=X, expand=True)
+		
+		# Setup button
+		self.setup = Button(self.btnContainer, text='⚙ Setup', font=btn_font,
+			bg=self.ACCENT, fg='white', activebackground=self.ACCENT_HOVER, activeforeground='white',
+			bd=0, padx=btn_padx, pady=btn_pady, cursor='hand2', command=self.setupMovie)
+		self.setup.pack(side=LEFT, padx=(8, 4), pady=8)
+		
+		# Play button
+		self.start = Button(self.btnContainer, text='▶ Play', font=btn_font,
+			bg=self.ACCENT, fg='white', activebackground=self.ACCENT_HOVER, activeforeground='white',
+			bd=0, padx=btn_padx, pady=btn_pady, cursor='hand2', command=self.playMovie)
+		self.start.pack(side=LEFT, padx=4, pady=8)
+		
+		# Pause button
+		self.pause = Button(self.btnContainer, text='⏸ Pause', font=btn_font,
+			bg=self.ACCENT, fg='white', activebackground=self.ACCENT_HOVER, activeforeground='white',
+			bd=0, padx=btn_padx, pady=btn_pady, cursor='hand2', command=self.pauseMovie)
+		self.pause.pack(side=LEFT, padx=4, pady=8)
+		
+		# Teardown button
+		self.teardown = Button(self.btnContainer, text='⏹ Teardown', font=btn_font,
+			bg=self.ACCENT, fg='white', activebackground=self.ACCENT_HOVER, activeforeground='white',
+			bd=0, padx=btn_padx, pady=btn_pady, cursor='hand2', command=self.exitClient)
+		self.teardown.pack(side=LEFT, padx=4, pady=8)
+		
+		# Describe button
+		self.describe = Button(self.btnContainer, text='ℹ Describe', font=btn_font,
+			bg=self.ACCENT, fg='white', activebackground=self.ACCENT_HOVER, activeforeground='white',
+			bd=0, padx=btn_padx, pady=btn_pady, cursor='hand2', command=self.describeMovie)
+		self.describe.pack(side=LEFT, padx=4, pady=8)
+		
+		# === Status Bar (row 2) - FPS, buffer, loss ===
+		self.statusFrame = Frame(self.master, bg=self.BG_SECONDARY, bd=0,
+			highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+		self.statusFrame.grid(row=2, column=0, sticky='ew', padx=8, pady=(0, 8))
+		
+		status_font = ('Consolas', 9)
+		self.statusLabel = Label(self.statusFrame, text='Status: Idle', font=status_font,
+			bg=self.BG_SECONDARY, fg=self.TEXT_DIM, anchor='w', padx=10, pady=4)
+		self.statusLabel.pack(side=LEFT, fill=X, expand=True)
+		
+		self.fpsLabel = Label(self.statusFrame, text='FPS: --', font=status_font,
+			bg=self.BG_SECONDARY, fg=self.SUCCESS, anchor='e', padx=10, pady=4)
+		self.fpsLabel.pack(side=RIGHT)
 	
 	def setupMovie(self):
 		"""Setup button handler."""
@@ -273,8 +328,11 @@ class Client:
 			if len(self.frameBuffer) >= BUFFER_SIZE:
 				self.bufferReady = True
 				print(f"[BUFFER] Initial buffering complete ({BUFFER_SIZE} frames)")
+				self.statusLabel.configure(text=f'Status: Playing ({self.mode} mode)', fg=self.SUCCESS)
 			else:
 				# Still buffering, check again later
+				bufPct = int(len(self.frameBuffer) / BUFFER_SIZE * 100)
+				self.statusLabel.configure(text=f'Buffering... {bufPct}% ({len(self.frameBuffer)}/{BUFFER_SIZE})', fg=self.WARNING)
 				self.master.after(50, self.displayFromBuffer)
 				return
 		
@@ -289,12 +347,15 @@ class Client:
 			if elapsed >= 1.0:
 				fps = self.fpsCounter / elapsed
 				print(f"[FPS] {fps:.1f} frames/sec | Buffer: {len(self.frameBuffer)} | Lost: {self.lostPackets}")
+				# Update GUI status bar
+				self.fpsLabel.configure(text=f'FPS: {fps:.1f}  |  Buf: {len(self.frameBuffer)}  |  Lost: {self.lostPackets}')
 				self.fpsCounter = 0
 				self.fpsStartTime = now
 		else:
 			# 3.2: Jitter Handling - buffer underrun
 			if self.bufferReady:
 				print("[JITTER] Buffer underrun - pausing display temporarily")
+				self.statusLabel.configure(text='Buffering... (jitter recovery)', fg=self.WARNING)
 				self.bufferReady = False
 		
 		# Schedule next display (~20 FPS = 50ms interval)
@@ -310,10 +371,28 @@ class Client:
 		return cachename
 	
 	def updateMovie(self, imageFile):
-		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
-		self.label.image = photo
+		"""Update the image file as video frame in the GUI (auto-scale to fit)."""
+		try:
+			img = Image.open(imageFile)
+			
+			# Get video frame dimensions to fit
+			frame_w = self.videoFrame.winfo_width()
+			frame_h = self.videoFrame.winfo_height()
+			
+			if frame_w > 10 and frame_h > 10:
+				# Scale image to fit while maintaining aspect ratio
+				img_w, img_h = img.size
+				ratio = min(frame_w / img_w, frame_h / img_h)
+				new_w = int(img_w * ratio)
+				new_h = int(img_h * ratio)
+				if new_w > 0 and new_h > 0:
+					img = img.resize((new_w, new_h), Image.LANCZOS)
+			
+			photo = ImageTk.PhotoImage(img)
+			self.label.configure(image=photo, text='')
+			self.label.image = photo
+		except Exception as e:
+			pass  # Skip display errors silently
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
